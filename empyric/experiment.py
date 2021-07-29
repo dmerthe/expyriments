@@ -6,6 +6,7 @@ import datetime
 import numbers
 from collections import deque
 from scipy.interpolate import interp1d
+from scipy.linalg import toeplitz, pinv2
 import numpy as np
 import pandas as pd
 import threading
@@ -480,15 +481,25 @@ class PredictiveControl(Routine):
     then sets x to minimize the error in y relative to setpoint, over some time interval defined by cutoff.
     """
 
+    y_noise_points = 10  # number of points to use to estimate y noise; maybe can be user defined eventually
+
     @property
     def certain(self):
         # Determine if model is certain enough to make predictions
 
+        if self.t[-1] - self.t[0] < self.learning_time:
+            # need more time to learn
+            return False
+        elif not self.predictions:
+            # predictions have expired
+            return False
+        elif self.predictions[0]['var_y'] > self.tolerance**2:
+            # the next prediction is not reliable enough
+            return False
+        else:
+            return True
 
-
-        return False
-
-    def __init__(self, meters=None, response_time='10 minutes', learning_time=None, horizon=None, tolerance=0.1, offset=0, **kwargs):
+    def __init__(self, meters=None, response_time='10 minutes', learning_time=None, horizon=None, wiggle=1, tolerance=1, **kwargs):
 
         Routine.__init__(self, **kwargs)
         self.meters = meters  # output variables
@@ -505,14 +516,14 @@ class PredictiveControl(Routine):
         else:
             self.horizon = self.response_time
 
-        self.tolerance = tolerance
-        self.y0 = offset
+        self.wiggle = wiggle  # amount to wiggle x in order to estimate m(t) and b
+        self.tolerance = tolerance  # permissable error in process value
 
         self.t = deque()  # times
         self.x = deque()  # control values
         self.y = deque()  # process values
 
-        self.model = {'m': None, 'var_m':None, 'b':None, 'var_b':None}
+        self.model = {'t':None, 'm': None, 'var_m':None, 'b':None, 'var_b':None, 'var_y':None}
         self.predictions = deque()
 
     def update(self, state):
@@ -531,35 +542,71 @@ class PredictiveControl(Routine):
                 self.x.popleft()
                 self.y.popleft()
 
-            if not self.predictions():
-                self._update_model()
-                self._predict()
-
-            if self.certain:
-                self.knobs[0].value = self.predictions.popleft()
+            if self.certain:  # model is sufficently accurate and predictions have been made
+                self.knobs[0].value = self.predictions.popleft()['y']
             else:
-                self._wiggle()
+                if len(self.t) <= y_noise_points:
+                    pass  # do nothing for a few points to measure noise level of y
+                else:
+                    # vary x to learn reponse of y
+                    self.knobs[0].value = self.x[-1] + self.wiggle*(2*np.random.rand() - 1)
+
+                if self.t[-1] - self.t[0] > self.learning_time: # The learning period has elapsed
+                    self._update_model()  # estimate the transfer function
+                    self._make_predictions()  # make predictions for optimal settings
 
     def _update_model(self):
-        # Estimate the transfer function m(t) and y0
-
-        if self.t[-1] - self.t[0] < self.learning_time:
-            return
+        """Estimate the transfer function m(t) and offset b"""
 
         # Homogenize data
         t = np.linspace(self.t[0], self.t[-1], len(self.t))
-        y = interp1d(self.t, self.y)(t)
-        x = interp1d(self.t, self.x)(t)
+        x = np.interp(t, self.t, self.x)
+        y = np.interp(t, self.t, self.y)
 
-        N = len(t[t[-1] - t >= self.response_time])
+        # Calculate estimates
+        N = len(t[t - t[0] > self.response_time])
+        K = len(t[t - t[0] <= self.response_time])
 
-    def _predict(self):
-        # Estimate future optimal settings for x(t)
+        X = np.concatenate([np.ones((N,1)), toeplitz(c=x[K:K+N], r=x[:K:-1])], axis=1)
 
-        return
+        Xpinv = pinv2(X)
 
-    def _wiggle(self):
-        # Vary x to learn response of y
+        b, *m = Xpinv.dot(y).flatten()
+
+        if self.model['var y'] is None:
+            self.model['var y'] = np.var(y[:self.y_noise_points])
+
+        var_b, *var_m = self.model['var y'] * np.diag(Xpinv.dot(Xpinv.T))
+
+        tt = t[1:K+1] - t[0]
+
+        if self.model['m'] is None:
+
+            self.model['t'] = tt
+            self.model['m'] = m
+            self.model['b'] = b
+            self.model['var m'] = var_m
+            self.model['var b'] = var_b
+        else:
+
+            # Update offset b
+            b_old, var_b_old = self.model['b'], self.model['var b']
+
+            self.model['b'] = (1 / var_b) * b + (1 / var_b_old) * b_old
+            self.model['var b'] = var_b * var_b_old / (var_b + var_b_old)
+
+            # Update transfer function m(t) on same time coordinates
+            m_new = np.interp(self.model['t'], tt, m, left=0, right=0)
+            m_old = self.model['m']
+
+            var_m_new = np.interp(self.model['t'], tt, var_m, left=np.inf, right=np.inf)
+            var_m_old = self.model['var m']
+
+            self.model['m'] = ((1 / var_m_new) * m_new + (1 / var_m_old) * m_old) / ((1 / var_m_new) + (1 / var_m_old))
+            self.model['var m'] = var_m_new * var_m_old / (var_m_new + var_m_old)
+
+    def _make_predictions(self):
+        """Estimate future optimal settings for x(t)"""
 
         return
 
